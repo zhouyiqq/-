@@ -1,0 +1,488 @@
+import configparser
+import copy
+import datetime
+import json
+import os
+import time
+from typing import Any
+
+import openai
+from dotenv import load_dotenv
+import requests
+
+from zilliz import zilliz
+# from zillizvector.knowledge_manage import KnowledgeManage
+
+# load_dotenv()
+openai.api_key = "sb-8520d06b471a554c26cdcf1e39afd634d761da53fc506406"
+openai.api_base = "https://api.openai-sb.com/v1"
+DATABASE_URL = os.getenv("DATABASE_URL")
+NAME_DATA_PATH = '../name_data.json'
+
+
+def get_db():
+    cfp = configparser.RawConfigParser()
+    cfp.read('./config.ini')
+    milvus_uri = cfp.get('example', 'uri')
+    # user = cfp.get('example', 'user')
+    # password = cfp.get('example', 'password')
+    token = cfp.get('example', 'token')
+    db = zilliz(cluster="Cluster-Owl", collection_name="information",
+                uri=milvus_uri, token=token)
+    try:
+        yield db
+    except:
+        print("无法进行连接")
+
+
+def num2tex(num):
+    # 定义数字到文本的映射字典
+    mapping = {
+        0: "未知",
+        1: '币种',
+        2: '板块',
+        3: '软件',
+        4: '交易所',
+        5: 'NFT',
+        6: '人物'
+    }
+
+    if type(num) == list:
+        # 使用map函数将数字映射为对应的文本
+        texts = list(map(lambda nu: mapping.get(nu), num))
+        # 使用filter函数过滤掉非法的映射结果
+        texts = list(filter(lambda text: text is not None, texts))
+    else:
+        texts = mapping.get(num)
+    # print(filtered_texts)
+    return texts
+
+
+# timestamp = 1688804969
+
+
+def get_timestamp(timestamp):
+    dt_object = datetime.datetime.fromtimestamp(timestamp)
+    return dt_object
+
+    # print("时间戳：", timestamp)
+    # print("转换后的时间：", dt_object)
+
+
+def num2tex2(num):
+    # 定义数字到文本的映射字典
+    mapping = {
+        0: "未知",
+        1: '快讯',
+        2: '文章',
+        3: '路线图',
+        4: '其他',
+    }
+
+    if type(num) == list:
+        # 使用map函数将数字映射为对应的文本
+        texts = list(map(lambda nu: mapping.get(nu), num))
+        # 使用filter函数过滤掉非法的映射结果
+        texts = list(filter(lambda text: text is not None, texts))
+    else:
+        texts = mapping.get(num)
+    # print(filtered_texts)
+    return texts
+
+
+def knowledge_answers(question, knowledge):
+    content = f"请扮演一名专业分析师，根据以下内容用中文回答问题：{question}。如果您认为给出的内容和问题无关或没有提出问题，请忽略该数据内容再用中文回答。{knowledge}"
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo-16k-0613",
+        messages=[{"role": "system", "content": content}],
+        temperature=0.3
+    )
+    answer = response.get("choices")[0].get("message").get("content")
+    return answer
+
+
+async def summarize_text(text):
+    # 文本摘要
+    content = f"文章摘要应概括主要要点，保持准确性和简洁性。请勿重复，并确保涵盖不同的观点和信息。总结的字数尽可能短，但不要损失关键信息。 请对以下文章进行总结：\n{text}"
+    response = await openai.ChatCompletion.acreate(
+        model="gpt-3.5-turbo-16k-0613",
+        messages=[{"role": "user", "content": content}],
+        temperature=0.3
+    )
+    summarized_text = response.get("choices")[0].get("message").get("content")
+    return summarized_text
+
+
+# def filter_information(text):
+#     # 文本过滤
+#     content = f"判断以下信息是否与币圈和金融相关，如果相关输出'True',如果不相关输出'False'\n{text}"
+#     response = openai.ChatCompletion.create(
+#         model="gpt-3.5-turbo-16k-0613",
+#         messages=[{"role": "user", "content": content}],
+#         temperature=0.3
+#     )
+#     filter_text = response.get("choices")[0].get("message").get("content")
+#     return filter_text
+
+
+async def filter_information(text):
+    # 文本过滤
+    content = f"首先你需要分析句子的语法，把可能的实体抽取出来，实体大部分是与币圈相关的，优先抽取币圈相关的实体，并以列表的形式返回,返回的格式为 ['实体A','实体B'],如果没有实体则返回空列表:'\n{text}"
+    response = await openai.ChatCompletion.acreate(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": content}],
+        temperature=0
+    )
+    filter_text = response.get("choices")[0].get("message").get("content")
+    return filter_text
+
+
+def filter_entity(text, entity, type):
+    # 过滤实体
+    content = f"你是一个币圈的专家，你会对#{text}#内容结合实体列表%{entity}%和实体类型${type}$进行判断,对##内没有提到的实体,在%%实体列表中去除,并返回##实体列表,只返回实体列表"
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": content}],
+        temperature=0
+    )
+    filter_text = response.get("choices")[0].get("message").get("content")
+    return filter_text
+
+
+async def get_names_from_db() -> list:
+    """从数据库获取实体名字
+
+    Returns:
+        _type_: 实体数据
+    """
+    from databases import Database
+
+    db_data = dict()
+
+    database = Database(
+        url=DATABASE_URL)
+    await database.connect()
+
+    # 币种
+    query = f"SELECT id, name, symbol FROM token ORDER BY market_cap DESC"
+    token_res = await database.fetch_all(query=query)
+    for r in token_res:
+        db_data[f'key_{1}_{r[0]}'] = dict(
+            id=r[0], name=r[2], alias=[r[2], r[1]], type=1)
+
+    # 板块
+    query = f"SELECT id, name, name_en FROM label ORDER BY id DESC"
+    label_res = await database.fetch_all(query=query)
+    for r in label_res:
+        db_data[f'key_{2}_{r[0]}'] = dict(
+            id=r[0], name=r[1], alias=[r[1], r[2]], type=2)
+
+    # 切换数据库
+    await database.execute("USE bitaegis_strapi;")
+
+    # 软件
+    query = f"SELECT id, name FROM software ORDER BY downloads DESC"
+    software_res = await database.fetch_all(query=query)
+    for r in software_res:
+        db_data[f'key_{3}_{r[0]}'] = dict(
+            id=r[0], name=r[1], alias=[r[1]], type=3)
+
+    await database.disconnect()
+
+    return db_data
+
+
+def get_name_dict():
+    json_name = NAME_DATA_PATH
+
+    # 读取 json
+    with open(json_name, 'r') as f:
+        db_data = json.load(f)
+
+    # 数据格式转换
+    name_dict = dict()  # 匹配名称映射，别名-> ID + 名称
+    for k, data in db_data.items():
+        id, name, alias_list, type = data['id'], data['name'], data['alias'], data['type']
+        if not name:
+            continue
+        # 结构化 映射返回结果
+        dict_res = dict(id=id, name=name, alias=[
+                        a for a in alias_list if a], type=type)
+        for alias in alias_list:
+            if not alias:
+                continue
+            if alias not in name_dict:
+                name_dict[alias] = [dict_res]
+            elif dict_res not in name_dict[alias]:
+                name_dict[alias].append(dict_res)
+    return name_dict
+
+
+def get_ac():
+    import ahocorasick
+
+    # 创建 Aho-Corasick 自动机，并加入模式字符串
+    ac = ahocorasick.Automaton()
+
+    name_dict = get_name_dict()
+
+    # 构建自动机
+    for k in name_dict:
+        for n in name_dict[k]:
+            for name in n['alias']:
+                if not name:
+                    continue
+                ac.add_word(str(name).lower().replace(' ', ''), name)
+    ac.make_automaton()
+    return ac
+
+
+async def ac_extract(ac, question: str,):
+    """AC 自动机 抽取实体
+
+    Args:
+        question (str): 问题
+
+    Returns:
+        list[dict[str, Any]]: 抽取结果
+    """
+    # matches = await filter_information(question)
+    # matches = eval(matches)
+    # if matches:
+    json_name = NAME_DATA_PATH
+
+    # 读取 json
+    with open(json_name, 'r') as f:
+        db_data = json.load(f)
+    import re
+    # 使用正则表达式匹配句子中的英文单词
+    print(question)
+    english_words = re.findall(r'[a-zA-Z0-9]+', question)
+    print(english_words)
+    # 数据格式转换
+    name_dict = dict()  # 匹配名称映射，别名-> ID + 名称
+    for k, data in db_data.items():
+        id, name, alias_list, type = data['id'], data['name'], data['alias'], data['type']
+        if not name:
+            continue
+        # 结构化 映射返回结果
+        dict_res = dict(id=id, name=name, alias=[
+                        a for a in alias_list if a], type=type)
+        for alias in alias_list:
+            if not alias:
+                continue
+            if alias not in name_dict:
+                name_dict[alias] = [dict_res]
+            elif dict_res not in name_dict[alias]:
+                name_dict[alias].append(dict_res)
+
+    # 在文本字符串中查找匹配项
+    patterns = [pattern for _, pattern in ac.iter(
+        question.lower())]
+    # 进行去重，去重是必要的防止重复导致全部无法匹配
+    patterns = list(set(patterns))
+    # 去除被包括关系的元素
+    result = [x for i, x in enumerate(patterns) if not any(
+        [x.lower() in patterns[j].lower() and i != j for j in range(len(patterns))])]
+    # print(result)
+    data = copy.deepcopy(result)
+    for a in english_words:
+        for b in result:
+            if (b.lower() in a.lower() and b.lower() != a.lower()):
+                try:
+                    data.remove(b)
+                except:
+                    print("Error removing")
+    # type = []
+    # for da in data:
+    #     # print(num2tex(name_dict[da][0]["type"]))
+    #     type.append(num2tex(name_dict[da][0]["type"]))
+    # print(question, data, type)
+    # print(filter_entity(question, data, type))
+    # print(data)
+    # print()
+    # # 设置一些常用词，如果出现，让gpt判断一下语义进行筛选
+    # stop_word = ["支付", "钱包", "数据", "音乐", "存储",
+    #              "大数据", "借贷", "游戏", "VS", "广告", "生态", "T", "APPLE", "GAS", "42", "七", "AI", "A", "CEO", "COM", "ATM", "DAO", "社交", "super", "APP", "THE", "op", "pass", "LABS", "网络"]
+    # result = copy.deepcopy(data)
+    # for da in data:
+    #     if da.lower() in stop_word:
+    #         result.remove(da)
+    # print(question, result)
+    # time.sleep(3)
+    # 结构化返回
+    matches = [dict(key=r, meta=name_dict[r]) for r in result]
+    return matches
+
+
+async def get_name_data(kw: str = '', type: int = 0, id: int = 0, page_index: int = 1, page_size: int = 10):
+    """获取实体数据
+
+    Returns:
+        _type_: _description_
+    """
+    json_name = NAME_DATA_PATH
+    kw = str(kw).lower().replace(' ', '')
+
+    # 读取 json
+    with open(json_name, 'r') as f:
+        db_data = json.load(f)
+
+    # 返回指定实体详情
+    if type and id:
+        return dict(db_data.get(f'key_{type}_{id}'))
+
+    # 原始列表
+    all_data = []
+    for k in db_data:
+        d = db_data[k]
+
+        # 类型过滤
+        if type and d['type'] != type:
+            continue
+
+        # 关键词过滤
+        alias = d.get('alias', [])
+        alias_str = ' '.join([str(a).lower().replace(' ', '')
+                             for a in alias if a])
+        if kw and kw not in alias_str:
+            continue
+        all_data.append(d)
+
+    # 分页
+    start_index = (page_index - 1) * page_size
+    end_index = start_index + page_size
+    data = all_data[start_index:end_index]
+
+    return dict(list=data, total=len(all_data), page_index=page_index, page_size=page_size)
+
+
+async def handle_name_data(type: int, id: int, data, status: int) -> None:
+    """处理 实体数据
+
+    Args:
+        type (int): 类型 1: 币种 2: 板块 3: 软件
+        id (int): MySQL 中的实体 ID
+        data (list[dict]): 实体数据
+        status (int): 修改状态 1: 新增 2: 更新 3:删除
+    """
+    json_name = NAME_DATA_PATH
+
+    # 读取 json
+    with open(json_name, 'r') as f:
+        db_data = json.load(f)
+
+    # 更新 json
+    key = f'key_{type}_{id}'
+    if status == 1 and key not in db_data:
+        db_data[key] = data
+    if status == 2 and key in db_data:
+        db_data[key] = data
+    elif status == 3:
+        del db_data[key]
+
+    # 保存 json
+    with open(json_name, 'w') as f:
+        json.dump(db_data, f)
+
+
+def get_token():
+    payload = json.dumps({
+        "password": "okewQy5yJ5HkNFqf",
+        "name": "周义"
+    })
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    url = "https://kapi.coregem.net" + "/user/login"
+    response = requests.request("POST", url, headers=headers, data=payload)
+    token = json.loads(response.text)['data']['token']
+    return token
+
+
+def get_ai_knowledge_list(token):
+    url = "https://kapi.coregem.net/ai/knowledge/list"
+    # payload = json.dumps({
+    #     "id": "test"
+    # })
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    # requests.request("POST", url, headers=headers, data=payload)
+    return requests.request("get", url, headers=headers).content
+
+
+def create_ai_knowledge(token, type, title, content):
+    # b'{"status":200,"message":"OK","data":{"id":1}}'
+    url = "https://kapi.coregem.net/ai/knowledge"
+    payload = json.dumps({
+        "type": type,
+        "title": title,
+        "content": content,
+    })
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    request = requests.request("POST", url, headers=headers, data=payload)
+    return request.content
+
+
+def update_ai_knowledge(token, id, type, title, content):
+    url = "https://kapi.coregem.net/ai/knowledge"
+    payload = json.dumps({
+        "id": id,
+        "type": type,
+        "title": title,
+        "content": content,
+    })
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    request = requests.request("POST", url, headers=headers, data=payload)
+    return request.content
+
+
+def delete_ai_knowledge(token, id):
+    url = "https://kapi.coregem.net/ai/knowledge"
+    payload = json.dumps({
+        "id": id,
+    })
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    request = requests.request("POST", url, headers=headers, data=payload)
+    return request.content
+
+
+if __name__ == '__main__':
+    # print(create_ai_knowledge(get_token(), type=1, title="dgdfgg",
+    #       content="afhjkshvaiodoidsjuviodfsiip"))
+    print(get_token())
+    # print(get_ai_knowledge_list(get_token()))
+    # delete_ai_knowledge(get_token(), id=7)
+    # print(get_ai_knowledge_list(get_token()))
+    # update_ai_knowledge(get_token(), id=7, type=4,
+    #                     title="11111", content="11111")
+
+    import asyncio
+
+    # # 获取实体数据
+    # loop = asyncio.new_event_loop()
+    # data = loop.run_until_complete(get_name_data('Ontology 生态'))
+
+    # print(data)
+
+    # # 实体名称 处理
+    # data = {"id": 1, "name": "BTC", "alias": ["BTC", "Bitcoin", "大饼", "比特币", "数字黄金"], "type": 1}
+    # asyncio.run(handle_name_data(1, 1, data, 1))
+    # print('处理成功')
+
+    # 实体 抽取
+    # ac = get_ac()
+    # question = 'Aptos生态DeFi协议Thala将于8月分三阶段推出Thala V2'
+    # matches = asyncio.run(ac_extract(ac, question))
+    # print(matches)
